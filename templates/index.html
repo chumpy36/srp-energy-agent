@@ -167,6 +167,14 @@
             </div>
           </div>
           <div id="override-msg" class="small mt-2"></div>
+          <hr class="my-3" style="border-color:#30363d">
+          <label class="form-label small fw-semibold">Poll interval (min)</label>
+          <div class="input-group input-group-sm">
+            <input type="number" id="poll-interval" class="form-control bg-dark text-light border-secondary"
+                   min="5" max="240" step="5" value="{{ state.poll_interval_mins | default(30) }}">
+            <button class="btn btn-outline-info" onclick="setPollInterval()">Save</button>
+          </div>
+          <div id="poll-msg" class="small mt-2"></div>
         </div>
       </div>
     </div>
@@ -297,6 +305,36 @@ async function setOverride(zone) {
   } catch (e) {
     msg.textContent = 'Request failed: ' + e.message;
     msg.className = 'small text-danger';
+  }
+}
+
+// ── Poll interval ─────────────────────────────────────────────────────────
+async function setPollInterval() {
+  const input = document.getElementById('poll-interval');
+  const msg   = document.getElementById('poll-msg');
+  const val   = parseInt(input.value, 10);
+  if (!val || val < 5 || val > 240) {
+    msg.textContent = 'Enter 5–240 minutes.';
+    msg.className   = 'small text-warning';
+    return;
+  }
+  try {
+    const r = await fetch('/api/poll-interval', {
+      method:  'POST',
+      headers: {'Content-Type': 'application/json'},
+      body:    JSON.stringify({minutes: val}),
+    });
+    const j = await r.json();
+    if (j.ok) {
+      msg.textContent = `Saved — agent now polls every ${j.minutes} min.`;
+      msg.className   = 'small text-success';
+    } else {
+      msg.textContent = 'Error: ' + JSON.stringify(j);
+      msg.className   = 'small text-danger';
+    }
+  } catch (e) {
+    msg.textContent = 'Request failed: ' + e.message;
+    msg.className   = 'small text-danger';
   }
 }
 

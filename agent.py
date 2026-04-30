@@ -631,6 +631,10 @@ def get_nest_state(config: dict) -> dict:
             temp_trait = traits.get("sdm.devices.traits.Temperature", {})
             heat_trait = traits.get("sdm.devices.traits.ThermostatTemperatureSetpoint", {})
             info_trait = traits.get("sdm.devices.traits.Info", {})
+            eco_trait  = traits.get("sdm.devices.traits.ThermostatEco", {})
+            mode_trait = traits.get("sdm.devices.traits.ThermostatMode", {})
+            eco_active = eco_trait.get("mode", "OFF") != "OFF"
+            hvac_mode  = mode_trait.get("mode", "OFF")
 
             name_display = info_trait.get("customName") or ""
             if not name_display:
@@ -660,18 +664,23 @@ def get_nest_state(config: dict) -> dict:
                     "set_temp_f":     set_f,
                     "device_name":    name_display,
                     "device_id":      device["name"],
+                    "eco_active":     eco_active,
+                    "hvac_mode":      hvac_mode,
                 }
-                log.info(f"Nest [{zone_id}] {name_display}: current {ambient_f}°F, set {set_f}°F")
+                eco_tag = " [ECO]" if eco_active else ""
+                log.info(f"Nest [{zone_id}] {name_display}: current {ambient_f}°F, set {set_f}°F, mode {hvac_mode}{eco_tag}")
 
         return result
     except Exception as e:
         log.error(f"Nest GET error: {e}")
         return {}
 
-def set_nest_temp(config: dict, device_id: str, target_f: float, zone_label: str) -> bool:
+def set_nest_temp(config: dict, device_id: str, target_f: float, zone_label: str, hvac_mode: str = "") -> bool:
     """
     Push a new setpoint to a Nest thermostat.
-    Uses SetCool in summer, SetHeat in winter, both in shoulder months.
+    Picks SetCool / SetHeat / SetRange based on the device's current HVAC mode
+    (Nest rejects SetHeat when in COOL, etc). Falls back to season-based heuristic
+    when hvac_mode is unknown.
     """
     try:
         creds    = get_nest_credentials(config)
@@ -680,19 +689,31 @@ def set_nest_temp(config: dict, device_id: str, target_f: float, zone_label: str
             "Content-Type":  "application/json",
         }
         target_c  = round((target_f - 32) * 5 / 9, 1)
-        now       = datetime.now(TZ)
-        season    = get_season(now.month)
 
-        # Determine whether to set heat, cool, or both
-        if season in ("SUMMER", "SUMMER_PEAK"):
-            command   = "sdm.devices.commands.ThermostatTemperatureSetpoint.SetCool"
-            body      = {"params": {"coolCelsius": target_c}}
-        elif season == "WINTER":
-            command   = "sdm.devices.commands.ThermostatTemperatureSetpoint.SetHeat"
-            body      = {"params": {"heatCelsius": target_c}}
+        if hvac_mode == "COOL":
+            command = "sdm.devices.commands.ThermostatTemperatureSetpoint.SetCool"
+            body    = {"params": {"coolCelsius": target_c}}
+        elif hvac_mode == "HEAT":
+            command = "sdm.devices.commands.ThermostatTemperatureSetpoint.SetHeat"
+            body    = {"params": {"heatCelsius": target_c}}
+        elif hvac_mode == "HEATCOOL":
+            command = "sdm.devices.commands.ThermostatTemperatureSetpoint.SetRange"
+            body    = {"params": {"heatCelsius": target_c - 1, "coolCelsius": target_c + 1}}
+        elif hvac_mode == "OFF":
+            log.info(f"Nest [{zone_label}] is OFF — agent stays out")
+            return False
         else:
-            command   = "sdm.devices.commands.ThermostatTemperatureSetpoint.SetRange"
-            body      = {"params": {"heatCelsius": target_c - 1, "coolCelsius": target_c + 1}}
+            # Fallback: season-based (legacy behavior)
+            season = get_season(datetime.now(TZ).month)
+            if season in ("SUMMER", "SUMMER_PEAK"):
+                command = "sdm.devices.commands.ThermostatTemperatureSetpoint.SetCool"
+                body    = {"params": {"coolCelsius": target_c}}
+            elif season == "WINTER":
+                command = "sdm.devices.commands.ThermostatTemperatureSetpoint.SetHeat"
+                body    = {"params": {"heatCelsius": target_c}}
+            else:
+                command = "sdm.devices.commands.ThermostatTemperatureSetpoint.SetRange"
+                body    = {"params": {"heatCelsius": target_c - 1, "coolCelsius": target_c + 1}}
 
         body["command"] = command
         project = config["nest_project_id"]
@@ -980,6 +1001,9 @@ def _run_cycle(config: dict) -> None:
     # ── Act: push thermostat commands ─────────────────────────────────────────
     for zone_id, target_f in decision["thermostat_targets"].items():
         if zone_id in nest_devs:
+            if nest_devs[zone_id].get("eco_active"):
+                log.info(f"Nest [{zone_id}] in ECO mode — agent stays out (user override)")
+                continue
             device_id = nest_devs[zone_id]["device_id"]
             current   = nest_devs[zone_id]["set_temp_f"]
             # Only push if the target differs from current by more than 0.5°F
@@ -988,7 +1012,8 @@ def _run_cycle(config: dict) -> None:
                 # compressor startups (demand charge spike prevention)
                 if zone_id == "guest":
                     time.sleep(180)
-                set_nest_temp(config, device_id, target_f, zone_id)
+                set_nest_temp(config, device_id, target_f, zone_id,
+                              hvac_mode=nest_devs[zone_id].get("hvac_mode", ""))
             else:
                 log.info(f"Nest [{zone_id}] already at {current}°F — no command needed")
         else:

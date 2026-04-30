@@ -65,6 +65,7 @@ def shutdown() -> None:
 def dashboard(request: Request) -> HTMLResponse:
     state   = load_state()
     history = load_history()
+    state["poll_interval_mins"] = int(_config.get("poll_interval_mins", 30))
     log_lines: list[str] = []
     if LOG_FILE.exists():
         log_lines = LOG_FILE.read_text().splitlines()[-100:]
@@ -189,6 +190,26 @@ def nest_callback(code: str = "", state: str = "", error: str = "") -> HTMLRespo
         "<p>Tokens saved. The agent will pick them up on the next cycle.</p>"
         "<p><a href='/'>Back to dashboard</a></p>"
     )
+
+
+@app.get("/api/poll-interval")
+def get_poll_interval() -> dict:
+    return {"minutes": int(_config.get("poll_interval_mins", 30))}
+
+
+@app.post("/api/poll-interval")
+async def set_poll_interval(request: Request) -> dict:
+    body = await request.json()
+    minutes = body.get("minutes")
+    if not isinstance(minutes, (int, float)) or not (5 <= int(minutes) <= 240):
+        raise HTTPException(400, "minutes must be an integer between 5 and 240")
+    minutes = int(minutes)
+    _config["poll_interval_mins"] = minutes
+    CONFIG_FILE.write_text(json.dumps(_config, indent=2))
+    _scheduler.reschedule_job("agent", trigger="interval", minutes=minutes)
+    user = request.headers.get("CF-Access-Authenticated-User-Email", "unknown")
+    log.info(f"Poll interval changed to {minutes} min by {user}")
+    return {"ok": True, "minutes": minutes}
 
 
 @app.post("/api/override/{zone}")
