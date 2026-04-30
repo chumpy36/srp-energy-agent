@@ -1,0 +1,29 @@
+# ── Credentials (NEVER commit these) ─────────────────────────────────────
+config.json
+nest_token.json
+client_secrets.json
+*.pem
+*.key
+
+# ── Runtime data (generated, not source) ─────────────────────────────────
+data/
+logs/
+state.json
+day_history.json
+agent.log
+cron.log
+
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# ── Tesla cache ───────────────────────────────────────────────────────────
+.cache/
+
+# ── OS ────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db

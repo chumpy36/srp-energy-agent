@@ -1,0 +1,24 @@
+{
+  "_comment": "SRP Energy Agent — config.example.json. Copy to config.json and fill in your values.",
+
+  "tesla_email": "your.tesla.account@email.com",
+
+  "_comment_tesla_site_id": "Leave null to auto-detect from your account, or set manually (found in Tesla app URL or teslapy)",
+  "tesla_site_id": null,
+
+  "_comment_nest": "From Google Cloud Console → Device Access → your project",
+  "nest_project_id": "your-nest-project-id",
+
+  "_comment_nest_secrets": "Path to the OAuth2 client_secrets JSON downloaded from Google Cloud Console",
+  "nest_client_secrets_file": "client_secrets.json",
+
+  "_comment_zone_map": "Map Nest device display name fragments to zone IDs. Case-insensitive substring match.",
+  "nest_zone_map": {
+    "Family":  "family",
+    "Guest":   "guest"
+  },
+
+  "_comment_location": "Mesa AZ coordinates for Open-Meteo weather (defaults already set for Mesa)",
+  "latitude":  33.4152,
+  "longitude": -111.8315
+}

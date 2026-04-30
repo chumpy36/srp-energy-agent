@@ -1,0 +1,31 @@
+services:
+  srp-agent:
+    build: .
+    container_name: srp-energy-agent
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - TZ=America/Phoenix
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: srp-tunnel
+    restart: unless-stopped
+    network_mode: "service:srp-agent"
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=eyJhIjoiNGQ5MTZmNTQ4ZTFiNzdhYTc0Mzc4MjFhYWM1ZjMzYjEiLCJ0IjoiZWJkNzRmODctMDNlNC00MjRiLThmYTUtN2EyZTEyNzM3MTM5IiwicyI6Im9sK1lrNDhCcUZ6Y3E0dFNvWXc0cnhzWk1BSCtvM3AvRlVBdTRjZXpERXF2d2ZqU29rQ3JEZEMxT3VkK1VZM1B3OFFJUmJqK3hpWk5mNHJTNFpIMzZnPT0ifQ==
+    depends_on:
+      - srp-agent
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "3"
