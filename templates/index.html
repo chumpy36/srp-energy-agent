@@ -6,19 +6,26 @@
   <title>SRP Energy Agent</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
   <style>
-    body           { background:#0d1117; color:#c9d1d9; }
-    .card          { background:#161b22; border:1px solid #30363d; }
-    .card-header   { background:#21262d; border-bottom:1px solid #30363d; font-weight:600; }
-    .navbar        { background:#161b22 !important; border-bottom:1px solid #30363d; }
-    .log-box       { font-family:monospace; font-size:.73rem; max-height:320px;
-                     overflow-y:auto; background:#0d1117; border:1px solid #30363d;
-                     padding:10px; border-radius:4px; }
-    .batt-pct      { font-size:2.4rem; font-weight:700; line-height:1; }
-    .metric        { font-size:1.05rem; margin-bottom:.2rem; }
-    .progress      { height:18px; background:#21262d; }
-    .text-solar    { color:#f0e68c; }
-    .tbl-history   { font-size:.8rem; }
-    td, th         { white-space:nowrap; }
+    body                   { background:#0d1117; color:#c9d1d9; }
+    .card                  { background:#161b22; border:1px solid #30363d; color:#c9d1d9; }
+    .card-header           { background:#21262d; border-bottom:1px solid #30363d;
+                             color:#f0f6fc; font-weight:600; }
+    .card-body             { color:#c9d1d9; }
+    .navbar                { background:#161b22 !important; border-bottom:1px solid #30363d; }
+    .navbar .text-muted,
+    .text-muted            { color:#8b949e !important; }
+    .form-label            { color:#c9d1d9; }
+    .log-box               { font-family:monospace; font-size:.73rem; max-height:320px;
+                             overflow-y:auto; background:#0d1117; border:1px solid #30363d;
+                             padding:10px; border-radius:4px; color:#c9d1d9; }
+    .batt-pct              { font-size:2.4rem; font-weight:700; line-height:1; color:#f0f6fc; }
+    .metric                { font-size:1.05rem; margin-bottom:.2rem; }
+    .progress              { height:18px; background:#21262d; }
+    .text-solar            { color:#f0e68c; }
+    .tbl-history           { font-size:.8rem; }
+    .table-dark            { --bs-table-bg:#161b22; --bs-table-color:#c9d1d9;
+                             --bs-table-border-color:#30363d; }
+    td, th                 { white-space:nowrap; }
   </style>
 </head>
 <body>

@@ -46,12 +46,13 @@ def startup() -> None:
         log.error("config.json not found — dashboard starting without agent scheduler")
         return
     _config = json.loads(CONFIG_FILE.read_text())
+    poll_min = int(_config.get("poll_interval_mins", 30))
     _scheduler.add_job(
-        _agent_job, "interval", minutes=5, id="agent",
+        _agent_job, "interval", minutes=poll_min, id="agent",
         max_instances=1, next_run_time=datetime.now(TZ),
     )
     _scheduler.start()
-    log.info("APScheduler started — agent runs every 5 minutes")
+    log.info(f"APScheduler started — agent runs every {poll_min} minutes")
 
 
 @app.on_event("shutdown")
