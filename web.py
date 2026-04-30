@@ -16,6 +16,9 @@ from fastapi.templating import Jinja2Templates
 
 from agent import CONFIG_FILE, TZ, load_history, load_state, run_cycle, save_state
 from tesla_fleet import TeslaFleet
+from google_auth_oauthlib.flow import Flow as GoogleFlow
+
+NEST_SCOPES = ["https://www.googleapis.com/auth/sdm.service"]
 
 log = logging.getLogger("srp-web")
 
@@ -125,6 +128,63 @@ def tesla_callback(code: str = "", state: str = "", error: str = "") -> HTMLResp
         return HTMLResponse(f"<h1>Token exchange failed</h1><pre>{e}</pre>", status_code=500)
     return HTMLResponse(
         "<h1>Tesla authorized</h1>"
+        "<p>Tokens saved. The agent will pick them up on the next cycle.</p>"
+        "<p><a href='/'>Back to dashboard</a></p>"
+    )
+
+
+def _nest_redirect_uri() -> str:
+    return _config.get("nest_redirect_uri", "https://srp.hollandit.work/oauth/nest/callback")
+
+
+def _nest_flow(state: str | None = None) -> GoogleFlow:
+    secrets_path = BASE_DIR / "data" / _config.get("nest_client_secrets_file", "client_secrets.json")
+    flow = GoogleFlow.from_client_secrets_file(str(secrets_path), scopes=NEST_SCOPES, state=state)
+    flow.redirect_uri = _nest_redirect_uri()
+    return flow
+
+
+@app.get("/oauth/nest/login")
+def nest_login() -> RedirectResponse:
+    project_id = _config["nest_project_id"]
+    flow = _nest_flow()
+    auth_url, state = flow.authorization_url(
+        access_type="offline",
+        prompt="consent",
+        # SDM requires a partner-specific authorization endpoint:
+    )
+    sdm_url = (
+        f"https://nestservices.google.com/partnerconnections/{project_id}/auth"
+        f"?redirect_uri={_nest_redirect_uri()}"
+        f"&access_type=offline"
+        f"&prompt=consent"
+        f"&client_id={flow.client_config['client_id']}"
+        f"&response_type=code"
+        f"&scope={'+'.join(NEST_SCOPES)}"
+        f"&state={state}"
+    )
+    _oauth_states[state] = datetime.now().timestamp()
+    return RedirectResponse(sdm_url)
+
+
+@app.get("/oauth/nest/callback", response_class=HTMLResponse)
+def nest_callback(code: str = "", state: str = "", error: str = "") -> HTMLResponse:
+    if error:
+        return HTMLResponse(f"<h1>Nest OAuth error</h1><pre>{error}</pre>", status_code=400)
+    if state not in _oauth_states:
+        return HTMLResponse("<h1>Invalid OAuth state</h1>", status_code=400)
+    _oauth_states.pop(state, None)
+    try:
+        flow = _nest_flow(state=state)
+        flow.fetch_token(code=code)
+        token_path = BASE_DIR / "data" / "nest_token.json"
+        token_path.write_text(flow.credentials.to_json())
+        token_path.chmod(0o600)
+    except Exception as e:
+        log.error(f"Nest token exchange failed: {e}", exc_info=True)
+        return HTMLResponse(f"<h1>Token exchange failed</h1><pre>{e}</pre>", status_code=500)
+    return HTMLResponse(
+        "<h1>Nest authorized</h1>"
         "<p>Tokens saved. The agent will pick them up on the next cycle.</p>"
         "<p><a href='/'>Back to dashboard</a></p>"
     )

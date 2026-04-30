@@ -632,7 +632,15 @@ def get_nest_state(config: dict) -> dict:
             heat_trait = traits.get("sdm.devices.traits.ThermostatTemperatureSetpoint", {})
             info_trait = traits.get("sdm.devices.traits.Info", {})
 
-            name_display = info_trait.get("customName", device["name"])
+            name_display = info_trait.get("customName") or ""
+            if not name_display:
+                # Fall back to the parent room's displayName (e.g. "Family Room")
+                for rel in device.get("parentRelations", []):
+                    if rel.get("displayName"):
+                        name_display = rel["displayName"]
+                        break
+            if not name_display:
+                name_display = device["name"]
             ambient_c    = temp_trait.get("ambientTemperatureCelsius", 0)
             heat_c       = heat_trait.get("heatCelsius", heat_trait.get("coolCelsius", 0))
 

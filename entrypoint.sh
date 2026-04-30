@@ -40,30 +40,14 @@ if [ ! -f /app/data/tesla_tokens.json ]; then
     echo ""
 fi
 
-# ── First-run: Nest OAuth ─────────────────────────────────────────────────
+# ── Nest Fleet OAuth note ─────────────────────────────────────────────────
 if [ ! -f /app/data/nest_token.json ]; then
-    if [ -t 0 ]; then
-        echo ""
-        echo "Nest token not found — running first-time authorization..."
-        echo "A URL will be printed below. Open it in your browser,"
-        echo "grant access, then paste the redirect URL back here."
-        echo ""
-        python -c "
-import json
-from google_auth_oauthlib.flow import InstalledAppFlow
-from pathlib import Path
-config = json.load(open('/app/data/config.json'))
-scopes = ['https://www.googleapis.com/auth/sdm.service']
-flow   = InstalledAppFlow.from_client_secrets_file(
-    config.get('nest_client_secrets_file', 'client_secrets.json'), scopes
-)
-creds  = flow.run_console()
-Path('/app/data/nest_token.json').write_text(creds.to_json())
-print('Nest authorized successfully.')
-"
-    else
-        echo "WARNING: Nest not authorized. Run 'docker compose up' (without -d) to complete OAuth."
-    fi
+    echo ""
+    echo "NOTE: Nest tokens not found."
+    echo "After the dashboard starts, visit:"
+    echo "  https://srp.hollandit.work/oauth/nest/login"
+    echo "to complete OAuth."
+    echo ""
 fi
 
 echo ""

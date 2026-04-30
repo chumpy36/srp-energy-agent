@@ -23,6 +23,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # ── Copy source ───────────────────────────────────────────────────────────
 COPY agent.py .
 COPY web.py .
+COPY tesla_fleet.py .
 COPY templates/ templates/
 COPY entrypoint.sh .
 RUN chmod +x entrypoint.sh
