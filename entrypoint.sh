@@ -20,7 +20,7 @@ if [ ! -f /app/data/config.json ]; then
 fi
 
 # ── Symlink data files (in case volume wasn't mounted at build time) ───────
-for f in config.json state.json day_history.json nest_token.json client_secrets.json tesla_cache.json; do
+for f in config.json state.json day_history.json nest_token.json client_secrets.json tesla_tokens.json tesla_private_key.pem tesla_public_key.pem; do
     if [ ! -e /app/$f ] && [ -f /app/data/$f ]; then
         ln -sf /app/data/$f /app/$f
     fi
@@ -30,26 +30,14 @@ if [ ! -e /app/agent.log ]; then
     ln -sf /app/logs/agent.log /app/agent.log
 fi
 
-# ── First-run: Tesla OAuth ────────────────────────────────────────────────
-if [ ! -f /app/data/tesla_cache.json ]; then
-    if [ -t 0 ]; then
-        echo ""
-        echo "Tesla token not found — running first-time authorization..."
-        echo "A URL will be printed below. Open it in your browser,"
-        echo "complete login, then paste the redirect URL back here."
-        echo ""
-        python -c "
-import json, teslapy
-from pathlib import Path
-config = json.load(open('/app/data/config.json'))
-tesla  = teslapy.Tesla(config['tesla_email'], cache_file='/app/data/tesla_cache.json')
-if not tesla.authorized:
-    tesla.fetch_token()
-print('Tesla authorized successfully.')
-"
-    else
-        echo "WARNING: Tesla not authorized. Run 'docker compose up' (without -d) to complete OAuth."
-    fi
+# ── Tesla Fleet API auth note ─────────────────────────────────────────────
+if [ ! -f /app/data/tesla_tokens.json ]; then
+    echo ""
+    echo "NOTE: Tesla Fleet API tokens not found."
+    echo "After the dashboard starts, visit:"
+    echo "  https://srp.hollandit.work/oauth/tesla/login"
+    echo "to complete OAuth. Until then, the agent will skip Powerwall actions."
+    echo ""
 fi
 
 # ── First-run: Nest OAuth ─────────────────────────────────────────────────

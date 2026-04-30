@@ -5,15 +5,17 @@ FastAPI app + APScheduler (replaces cron in Docker).
 """
 import json
 import logging
+import secrets
 from datetime import datetime
 from pathlib import Path
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 from agent import CONFIG_FILE, TZ, load_history, load_state, run_cycle, save_state
+from tesla_fleet import TeslaFleet
 
 log = logging.getLogger("srp-web")
 
@@ -82,6 +84,50 @@ def api_log(n: int = 50) -> list[str]:
     if not LOG_FILE.exists():
         return []
     return list(reversed(LOG_FILE.read_text().splitlines()[-n:]))
+
+
+_oauth_states: dict[str, float] = {}
+
+
+def _tesla_client() -> TeslaFleet:
+    return TeslaFleet(
+        client_id=_config["tesla_client_id"],
+        client_secret=_config["tesla_client_secret"],
+        redirect_uri=_config["tesla_redirect_uri"],
+        tokens_file=str(BASE_DIR / "data" / "tesla_tokens.json"),
+    )
+
+
+@app.get("/.well-known/appspecific/com.tesla.3p.public-key.pem")
+def tesla_public_key() -> PlainTextResponse:
+    pem = (BASE_DIR / "data" / "tesla_public_key.pem").read_text()
+    return PlainTextResponse(pem, media_type="application/x-pem-file")
+
+
+@app.get("/oauth/tesla/login")
+def tesla_login() -> RedirectResponse:
+    state = secrets.token_urlsafe(32)
+    _oauth_states[state] = datetime.now().timestamp()
+    return RedirectResponse(_tesla_client().authorize_url(state))
+
+
+@app.get("/oauth/tesla/callback", response_class=HTMLResponse)
+def tesla_callback(code: str = "", state: str = "", error: str = "") -> HTMLResponse:
+    if error:
+        return HTMLResponse(f"<h1>Tesla OAuth error</h1><pre>{error}</pre>", status_code=400)
+    if state not in _oauth_states:
+        return HTMLResponse("<h1>Invalid OAuth state</h1>", status_code=400)
+    _oauth_states.pop(state, None)
+    try:
+        _tesla_client().exchange_code(code)
+    except Exception as e:
+        log.error(f"Tesla token exchange failed: {e}", exc_info=True)
+        return HTMLResponse(f"<h1>Token exchange failed</h1><pre>{e}</pre>", status_code=500)
+    return HTMLResponse(
+        "<h1>Tesla authorized</h1>"
+        "<p>Tokens saved. The agent will pick them up on the next cycle.</p>"
+        "<p><a href='/'>Back to dashboard</a></p>"
+    )
 
 
 @app.post("/api/override/{zone}")

@@ -26,7 +26,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
-import teslapy
+from tesla_fleet import TeslaFleet
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -511,11 +511,13 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
 # TESLA POWERWALL API
 # ═══════════════════════════════════════════════════════════════════════════
 
-def get_powerwall_state(tesla: teslapy.Tesla, config: dict) -> dict:
+def get_powerwall_state(tesla: TeslaFleet, config: dict) -> dict:
     """
     Fetch live Powerwall state. Returns:
       battery_pct, solar_kw, load_kw, grid_kw, grid_active
     """
+    if tesla is None:
+        return {}
     try:
         products = tesla.api("PRODUCT_LIST")["response"]
         site_id  = None
@@ -548,7 +550,7 @@ def get_powerwall_state(tesla: teslapy.Tesla, config: dict) -> dict:
         log.error(f"Powerwall API error: {e}")
         return {}
 
-def set_powerwall_mode(tesla: teslapy.Tesla, config: dict, grid_allowed: bool, battery_pct: float) -> None:
+def set_powerwall_mode(tesla: TeslaFleet, config: dict, grid_allowed: bool, battery_pct: float) -> None:
     """
     Set Powerwall operating mode.
     grid_allowed=False → backup_only (islanded, no grid import)
@@ -556,6 +558,9 @@ def set_powerwall_mode(tesla: teslapy.Tesla, config: dict, grid_allowed: bool, b
 
     Also sets backup reserve to BATTERY_FLOOR % to protect the hard floor.
     """
+    if tesla is None:
+        log.warning("Tesla not authorized — skipping Powerwall mode set")
+        return
     try:
         site_id = config.get("tesla_site_id")
         if not site_id:
@@ -881,9 +886,16 @@ def _run_cycle(config: dict) -> None:
     history = load_history()
 
     # ── Authenticate ─────────────────────────────────────────────────────────
-    tesla = teslapy.Tesla(config["tesla_email"], cache_file=str(BASE_DIR / "tesla_cache.json"))
+    tesla = TeslaFleet(
+        client_id=config["tesla_client_id"],
+        client_secret=config["tesla_client_secret"],
+        redirect_uri=config["tesla_redirect_uri"],
+        tokens_file=str(BASE_DIR / "data" / "tesla_tokens.json"),
+    )
     if not tesla.authorized:
-        tesla.fetch_token()
+        log.error("Tesla Fleet API not authorized — visit /oauth/tesla/login. Skipping Tesla actions this cycle.")
+        # Continue with Nest only — agent decisions degrade gracefully
+        tesla = None
 
     # ── Read sensors ─────────────────────────────────────────────────────────
     lat = config.get("latitude", 33.4152)
