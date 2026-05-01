@@ -60,10 +60,8 @@ BATTERY_KWH   = 13.5   # Powerwall 3 usable capacity
 BATTERY_FLOOR = 15     # % — never drain below this
 
 # Comfort setpoints
-DAY_COMFORT   = 76     # summer 5am–9pm (cooling target — don't get warmer than this)
-NIGHT_COMFORT = 73     # summer 9pm–5am
-WINTER_DAY_COMFORT   = 70     # winter 5am–9pm (heating target — don't get colder than this)
-WINTER_NIGHT_COMFORT = 67     # winter 9pm–5am
+DAY_COMFORT   = 76     # 5am–9pm
+NIGHT_COMFORT = 73     # 9pm–5am
 MAX_SETBACK   = 4      # °F above baseline, normal peak
 CRIT_SETBACK  = 6      # °F above baseline, critical
 MAX_PRECOOL   = 5      # °F below baseline, pre-peak
@@ -127,8 +125,6 @@ def is_nighttime(dt: datetime) -> bool:
     return dt.hour >= 21 or dt.hour < 5
 
 def comfort_temp(dt: datetime) -> int:
-    if get_season(dt.month) == "WINTER":
-        return WINTER_NIGHT_COMFORT if is_nighttime(dt) else WINTER_DAY_COMFORT
     return NIGHT_COMFORT if is_nighttime(dt) else DAY_COMFORT
 
 def get_peak_sub_phase(dt: datetime) -> str | None:
@@ -295,16 +291,6 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
     night       = is_nighttime(now)
     hour_frac   = now.hour + now.minute / 60
 
-    # Direction of HVAC influence is driven by the thermostat's actual mode,
-    # not the SRP calendar — Mesa shoulder-season weather often disagrees with
-    # SRP's Nov–Apr "winter" boundary. heating_dominant=True means lowering the
-    # setpoint reduces HVAC run (HEAT mode); False means raising it does (COOL).
-    zone_modes = state.get("zone_modes", {})
-    if zone_modes:
-        heating_dominant = all(m == "HEAT" for m in zone_modes.values())
-    else:
-        heating_dominant = (season == "WINTER")
-
     battery_pct  = state["battery_pct"]
     outside_f    = state["outside_temp_f"]
     solar_kw     = state.get("solar_kw", calc_solar_kw(hour_frac, outside_f))
@@ -399,31 +385,24 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
             kwh_needed  = total_load(0) * hrs_left
             kwh_margin  = batt_usable - kwh_needed
             margin_tier = calc_margin_tier(kwh_margin, battery_pct)
-            # Setback direction follows actual HVAC mode: heating → lower setpoint
-            # (heater off), cooling → raise setpoint (AC off).
-            thermo_delta = -margin_tier["setback"] if heating_dominant else +margin_tier["setback"]
+            thermo_delta = margin_tier["setback"]
             decisions.append(f"⚡ Winter {sub_phase} | {hrs_left}h left | Margin {kwh_margin:.1f}kWh → {margin_tier['label']}{hold_note}")
-            decisions.append(f"🌡️  family {zone_baselines['family']+thermo_delta}°F, guest {zone_baselines['guest']+thermo_delta}°F ({thermo_delta:+}°)")
+            decisions.append(f"🌡️  family {zone_baselines['family']+thermo_delta}°F, guest {zone_baselines['guest']+thermo_delta}°F (+{margin_tier['setback']}°)")
 
     # ── PRE-PEAK ─────────────────────────────────────────────────────────────
     elif pre_peak:
-        # Cooling: drop temp before peak so AC rides peak with compressor off
-        # Heating: raise temp before peak so heater rides peak with element off
-        sign  = +1 if heating_dominant else -1
-        verb  = "pre-heat" if heating_dominant else "pre-cool"
-        side  = "above"   if heating_dominant else "below"
         if not batt_good:
             lever        = "both"
             grid_allowed = True
-            pre_deg      = min(MAX_PRECOOL, 4 if solar_kw > 2 else 3)
-            thermo_delta = sign * pre_deg
+            pre_cool_deg = min(MAX_PRECOOL, 4 if solar_kw > 2 else 3)
+            thermo_delta = -pre_cool_deg
             kwh_deficit  = (target_pp - battery_pct) / 100 * BATTERY_KWH
             decisions.append(f"🔋 Lever 1 (grid): Charging to {target_pp}% | {battery_pct:.0f}% now | {kwh_deficit:.1f}kWh needed{hold_note}")
-            decisions.append(f"🌡️  Lever 2 ({verb}): family {zone_baselines['family']+thermo_delta}°F, guest {zone_baselines['guest']+thermo_delta}°F ({pre_deg}°F {side} baseline)")
+            decisions.append(f"🌡️  Lever 2 (pre-cool): family {zone_baselines['family']+thermo_delta}°F, guest {zone_baselines['guest']+thermo_delta}°F ({pre_cool_deg}°F below baseline)")
         else:
             lever        = "temp"
-            thermo_delta = sign * min(2, MAX_PRECOOL)
-            decisions.append(f"✅ Battery ready ({battery_pct:.0f}%) — gentle {verb}{hold_note}")
+            thermo_delta = -min(2, MAX_PRECOOL)
+            decisions.append(f"✅ Battery ready ({battery_pct:.0f}%) — gentle pre-cool{hold_note}")
             decisions.append(f"🌡️  family {zone_baselines['family']+thermo_delta}°F, guest {zone_baselines['guest']+thermo_delta}°F")
 
     # ── DAILY TOP-OFF ────────────────────────────────────────────────────────
@@ -571,13 +550,22 @@ def get_powerwall_state(tesla: TeslaFleet, config: dict) -> dict:
         log.error(f"Powerwall API error: {e}")
         return {}
 
-def set_powerwall_mode(tesla: TeslaFleet, config: dict, grid_allowed: bool, battery_pct: float) -> None:
+def set_powerwall_mode(tesla: TeslaFleet, config: dict, grid_allowed: bool,
+                       battery_pct: float, target_pp: int = 0,
+                       pre_peak: bool = False) -> None:
     """
-    Set Powerwall operating mode.
-    grid_allowed=False → backup_only (islanded, no grid import)
-    grid_allowed=True  → self_powered (grid assists when needed)
+    Set Powerwall operating mode + Lever 1 (grid charging).
 
-    Also sets backup reserve to BATTERY_FLOOR % to protect the hard floor.
+    Operating mode is ALWAYS self_consumption — the only mode where the battery
+    actually discharges to cover home load. Tesla's "backup" mode means
+    "save battery for outages, use grid for daily load" — the opposite of what
+    SRP optimization needs.
+
+    Lever 1 implementation: during pre-peak when battery is below target_pp,
+    raise backup_reserve_percent to target_pp. Powerwall treats that as a
+    must-hold reserve and pulls from grid+solar to reach it. Once peak begins,
+    reserve drops back to BATTERY_FLOOR so the battery can fully discharge
+    through the peak window.
     """
     if tesla is None:
         log.warning("Tesla not authorized — skipping Powerwall mode set")
@@ -593,17 +581,23 @@ def set_powerwall_mode(tesla: TeslaFleet, config: dict, grid_allowed: bool, batt
         if not site_id:
             log.error("Powerwall site_id not found — cannot set mode")
             return
-        mode    = "self_powered" if grid_allowed else "backup"
+
+        # Lever 1: force grid-charge to target_pp during pre-peak when needed
+        if pre_peak and grid_allowed and battery_pct < target_pp:
+            reserve = min(100, int(target_pp))
+            log.info(f"Lever 1 active: forcing grid-charge — reserve {reserve}% (battery at {battery_pct:.0f}%, target {target_pp}%)")
+        else:
+            reserve = BATTERY_FLOOR
 
         tesla.api("BATTERY_BACKUP_RESERVE",
                   path_vars={"site_id": site_id},
-                  backup_reserve_percent=BATTERY_FLOOR)
+                  backup_reserve_percent=reserve)
 
         tesla.api("BATTERY_OPERATION_MODE",
                   path_vars={"site_id": site_id},
-                  default_real_mode=mode)
+                  default_real_mode="self_consumption")
 
-        log.info(f"Powerwall mode → {mode} | reserve floor {BATTERY_FLOOR}%")
+        log.info(f"Powerwall mode → self_consumption | reserve {reserve}% | grid_allowed={grid_allowed}")
     except Exception as e:
         log.error(f"Powerwall set mode error: {e}")
 
@@ -703,11 +697,15 @@ SETPOINT_HEAT_MAX = 78
 
 def set_nest_temp(config: dict, device_id: str, target_f: float, zone_label: str, hvac_mode: str = "") -> bool:
     """
-    Push a new setpoint to a Nest thermostat.
-    Picks SetCool / SetHeat / SetRange based on the device's current HVAC mode
-    (Nest rejects SetHeat when in COOL, etc). Falls back to season-based heuristic
-    when hvac_mode is unknown. Setpoints are clamped to comfort range to avoid
-    triggering Nest's auto-Eco-on-extreme-setpoint heuristic.
+    Push a new setpoint to a Nest thermostat — Steve's canon season-based logic.
+    SetCool in summer, SetHeat in winter, SetRange in shoulder months.
+    User is expected to manually keep the thermostat in COOL or HEAT mode
+    matching the SRP season.
+
+    Setpoints are clamped (Option C) to keep Nest from auto-flipping to ECO
+    when the agent commands a far-from-room-temp setpoint:
+      cool:  65–80°F   (caps Critical tier at 80°F instead of canon's 82°F)
+      heat:  62–78°F
     """
     try:
         creds    = get_nest_credentials(config)
@@ -715,10 +713,11 @@ def set_nest_temp(config: dict, device_id: str, target_f: float, zone_label: str
             "Authorization": f"Bearer {creds.token}",
             "Content-Type":  "application/json",
         }
-        # Clamp setpoint to a safe comfort range
-        if hvac_mode == "COOL":
+        season    = get_season(datetime.now(TZ).month)
+        # Clamp by season (matches the command we're about to send)
+        if season in ("SUMMER", "SUMMER_PEAK"):
             clamped_f = max(SETPOINT_COOL_MIN, min(SETPOINT_COOL_MAX, target_f))
-        elif hvac_mode == "HEAT":
+        elif season == "WINTER":
             clamped_f = max(SETPOINT_HEAT_MIN, min(SETPOINT_HEAT_MAX, target_f))
         else:
             clamped_f = max(SETPOINT_HEAT_MIN, min(SETPOINT_COOL_MAX, target_f))
@@ -727,30 +726,15 @@ def set_nest_temp(config: dict, device_id: str, target_f: float, zone_label: str
             target_f = clamped_f
         target_c  = round((target_f - 32) * 5 / 9, 1)
 
-        if hvac_mode == "COOL":
+        if season in ("SUMMER", "SUMMER_PEAK"):
             command = "sdm.devices.commands.ThermostatTemperatureSetpoint.SetCool"
             body    = {"params": {"coolCelsius": target_c}}
-        elif hvac_mode == "HEAT":
+        elif season == "WINTER":
             command = "sdm.devices.commands.ThermostatTemperatureSetpoint.SetHeat"
             body    = {"params": {"heatCelsius": target_c}}
-        elif hvac_mode == "HEATCOOL":
+        else:
             command = "sdm.devices.commands.ThermostatTemperatureSetpoint.SetRange"
             body    = {"params": {"heatCelsius": target_c - 1, "coolCelsius": target_c + 1}}
-        elif hvac_mode == "OFF":
-            log.info(f"Nest [{zone_label}] is OFF — agent stays out")
-            return False
-        else:
-            # Fallback: season-based (legacy behavior)
-            season = get_season(datetime.now(TZ).month)
-            if season in ("SUMMER", "SUMMER_PEAK"):
-                command = "sdm.devices.commands.ThermostatTemperatureSetpoint.SetCool"
-                body    = {"params": {"coolCelsius": target_c}}
-            elif season == "WINTER":
-                command = "sdm.devices.commands.ThermostatTemperatureSetpoint.SetHeat"
-                body    = {"params": {"heatCelsius": target_c}}
-            else:
-                command = "sdm.devices.commands.ThermostatTemperatureSetpoint.SetRange"
-                body    = {"params": {"heatCelsius": target_c - 1, "coolCelsius": target_c + 1}}
 
         body["command"] = command
         project = config["nest_project_id"]
@@ -1016,7 +1000,6 @@ def _run_cycle(config: dict) -> None:
         "solar_kw":    pwall["solar_kw"],
         "load_kw":     pwall.get("load_kw", 0),
         "grid_kw":     pwall.get("grid_kw", 0),
-        "zone_modes":  {z: nest_devs[z].get("hvac_mode", "") for z in nest_devs},
     })
 
     # ── Update learning day record ────────────────────────────────────────────
@@ -1034,7 +1017,13 @@ def _run_cycle(config: dict) -> None:
              f"(base {decision['base_target']}% + hold adj {decision['hold_adj']}%)")
 
     # ── Act: set Powerwall mode ───────────────────────────────────────────────
-    set_powerwall_mode(tesla, config, decision["grid_allowed"], pwall["battery_pct"])
+    set_powerwall_mode(
+        tesla, config,
+        grid_allowed=decision["grid_allowed"],
+        battery_pct=pwall["battery_pct"],
+        target_pp=decision["target_pre_peak"],
+        pre_peak=decision.get("is_pre_peak", False),
+    )
 
     # ── Act: push thermostat commands ─────────────────────────────────────────
     for zone_id, target_f in decision["thermostat_targets"].items():
@@ -1050,8 +1039,7 @@ def _run_cycle(config: dict) -> None:
                 # compressor startups (demand charge spike prevention)
                 if zone_id == "guest":
                     time.sleep(180)
-                set_nest_temp(config, device_id, target_f, zone_id,
-                              hvac_mode=nest_devs[zone_id].get("hvac_mode", ""))
+                set_nest_temp(config, device_id, target_f, zone_id)
             else:
                 log.info(f"Nest [{zone_id}] already at {current}°F — no command needed")
         else:
