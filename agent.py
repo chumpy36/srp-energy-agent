@@ -60,8 +60,10 @@ BATTERY_KWH   = 13.5   # Powerwall 3 usable capacity
 BATTERY_FLOOR = 15     # % — never drain below this
 
 # Comfort setpoints
-DAY_COMFORT   = 76     # 5am–9pm
-NIGHT_COMFORT = 73     # 9pm–5am
+DAY_COMFORT   = 76     # summer 5am–9pm (cooling target — don't get warmer than this)
+NIGHT_COMFORT = 73     # summer 9pm–5am
+WINTER_DAY_COMFORT   = 70     # winter 5am–9pm (heating target — don't get colder than this)
+WINTER_NIGHT_COMFORT = 67     # winter 9pm–5am
 MAX_SETBACK   = 4      # °F above baseline, normal peak
 CRIT_SETBACK  = 6      # °F above baseline, critical
 MAX_PRECOOL   = 5      # °F below baseline, pre-peak
@@ -125,6 +127,8 @@ def is_nighttime(dt: datetime) -> bool:
     return dt.hour >= 21 or dt.hour < 5
 
 def comfort_temp(dt: datetime) -> int:
+    if get_season(dt.month) == "WINTER":
+        return WINTER_NIGHT_COMFORT if is_nighttime(dt) else WINTER_DAY_COMFORT
     return NIGHT_COMFORT if is_nighttime(dt) else DAY_COMFORT
 
 def get_peak_sub_phase(dt: datetime) -> str | None:
@@ -385,24 +389,30 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
             kwh_needed  = total_load(0) * hrs_left
             kwh_margin  = batt_usable - kwh_needed
             margin_tier = calc_margin_tier(kwh_margin, battery_pct)
-            thermo_delta = margin_tier["setback"]
+            # Winter: setback drops the heat setpoint so heater stays off during peak.
+            thermo_delta = -margin_tier["setback"]
             decisions.append(f"⚡ Winter {sub_phase} | {hrs_left}h left | Margin {kwh_margin:.1f}kWh → {margin_tier['label']}{hold_note}")
-            decisions.append(f"🌡️  family {zone_baselines['family']+thermo_delta}°F, guest {zone_baselines['guest']+thermo_delta}°F (+{margin_tier['setback']}°)")
+            decisions.append(f"🌡️  family {zone_baselines['family']+thermo_delta}°F, guest {zone_baselines['guest']+thermo_delta}°F ({thermo_delta:+}°)")
 
     # ── PRE-PEAK ─────────────────────────────────────────────────────────────
     elif pre_peak:
+        # Summer: drop temp (pre-cool) so AC can ride peak with compressor off
+        # Winter: raise temp (pre-heat) so heater can ride peak with element off
+        sign  = +1 if season == "WINTER" else -1
+        verb  = "pre-heat" if season == "WINTER" else "pre-cool"
+        side  = "above"   if season == "WINTER" else "below"
         if not batt_good:
             lever        = "both"
             grid_allowed = True
-            pre_cool_deg = min(MAX_PRECOOL, 4 if solar_kw > 2 else 3)
-            thermo_delta = -pre_cool_deg
+            pre_deg      = min(MAX_PRECOOL, 4 if solar_kw > 2 else 3)
+            thermo_delta = sign * pre_deg
             kwh_deficit  = (target_pp - battery_pct) / 100 * BATTERY_KWH
             decisions.append(f"🔋 Lever 1 (grid): Charging to {target_pp}% | {battery_pct:.0f}% now | {kwh_deficit:.1f}kWh needed{hold_note}")
-            decisions.append(f"🌡️  Lever 2 (pre-cool): family {zone_baselines['family']+thermo_delta}°F, guest {zone_baselines['guest']+thermo_delta}°F ({pre_cool_deg}°F below baseline)")
+            decisions.append(f"🌡️  Lever 2 ({verb}): family {zone_baselines['family']+thermo_delta}°F, guest {zone_baselines['guest']+thermo_delta}°F ({pre_deg}°F {side} baseline)")
         else:
             lever        = "temp"
-            thermo_delta = -min(2, MAX_PRECOOL)
-            decisions.append(f"✅ Battery ready ({battery_pct:.0f}%) — gentle pre-cool{hold_note}")
+            thermo_delta = sign * min(2, MAX_PRECOOL)
+            decisions.append(f"✅ Battery ready ({battery_pct:.0f}%) — gentle {verb}{hold_note}")
             decisions.append(f"🌡️  family {zone_baselines['family']+thermo_delta}°F, guest {zone_baselines['guest']+thermo_delta}°F")
 
     # ── DAILY TOP-OFF ────────────────────────────────────────────────────────
