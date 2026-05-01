@@ -696,12 +696,18 @@ def get_nest_state(config: dict) -> dict:
         log.error(f"Nest GET error: {e}")
         return {}
 
+SETPOINT_COOL_MIN = 65
+SETPOINT_COOL_MAX = 80
+SETPOINT_HEAT_MIN = 62
+SETPOINT_HEAT_MAX = 78
+
 def set_nest_temp(config: dict, device_id: str, target_f: float, zone_label: str, hvac_mode: str = "") -> bool:
     """
     Push a new setpoint to a Nest thermostat.
     Picks SetCool / SetHeat / SetRange based on the device's current HVAC mode
     (Nest rejects SetHeat when in COOL, etc). Falls back to season-based heuristic
-    when hvac_mode is unknown.
+    when hvac_mode is unknown. Setpoints are clamped to comfort range to avoid
+    triggering Nest's auto-Eco-on-extreme-setpoint heuristic.
     """
     try:
         creds    = get_nest_credentials(config)
@@ -709,6 +715,16 @@ def set_nest_temp(config: dict, device_id: str, target_f: float, zone_label: str
             "Authorization": f"Bearer {creds.token}",
             "Content-Type":  "application/json",
         }
+        # Clamp setpoint to a safe comfort range
+        if hvac_mode == "COOL":
+            clamped_f = max(SETPOINT_COOL_MIN, min(SETPOINT_COOL_MAX, target_f))
+        elif hvac_mode == "HEAT":
+            clamped_f = max(SETPOINT_HEAT_MIN, min(SETPOINT_HEAT_MAX, target_f))
+        else:
+            clamped_f = max(SETPOINT_HEAT_MIN, min(SETPOINT_COOL_MAX, target_f))
+        if clamped_f != target_f:
+            log.info(f"Nest [{zone_label}] target {target_f}°F clamped to {clamped_f}°F")
+            target_f = clamped_f
         target_c  = round((target_f - 32) * 5 / 9, 1)
 
         if hvac_mode == "COOL":
