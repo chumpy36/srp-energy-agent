@@ -295,6 +295,16 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
     night       = is_nighttime(now)
     hour_frac   = now.hour + now.minute / 60
 
+    # Direction of HVAC influence is driven by the thermostat's actual mode,
+    # not the SRP calendar — Mesa shoulder-season weather often disagrees with
+    # SRP's Nov–Apr "winter" boundary. heating_dominant=True means lowering the
+    # setpoint reduces HVAC run (HEAT mode); False means raising it does (COOL).
+    zone_modes = state.get("zone_modes", {})
+    if zone_modes:
+        heating_dominant = all(m == "HEAT" for m in zone_modes.values())
+    else:
+        heating_dominant = (season == "WINTER")
+
     battery_pct  = state["battery_pct"]
     outside_f    = state["outside_temp_f"]
     solar_kw     = state.get("solar_kw", calc_solar_kw(hour_frac, outside_f))
@@ -389,18 +399,19 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
             kwh_needed  = total_load(0) * hrs_left
             kwh_margin  = batt_usable - kwh_needed
             margin_tier = calc_margin_tier(kwh_margin, battery_pct)
-            # Winter: setback drops the heat setpoint so heater stays off during peak.
-            thermo_delta = -margin_tier["setback"]
+            # Setback direction follows actual HVAC mode: heating → lower setpoint
+            # (heater off), cooling → raise setpoint (AC off).
+            thermo_delta = -margin_tier["setback"] if heating_dominant else +margin_tier["setback"]
             decisions.append(f"⚡ Winter {sub_phase} | {hrs_left}h left | Margin {kwh_margin:.1f}kWh → {margin_tier['label']}{hold_note}")
             decisions.append(f"🌡️  family {zone_baselines['family']+thermo_delta}°F, guest {zone_baselines['guest']+thermo_delta}°F ({thermo_delta:+}°)")
 
     # ── PRE-PEAK ─────────────────────────────────────────────────────────────
     elif pre_peak:
-        # Summer: drop temp (pre-cool) so AC can ride peak with compressor off
-        # Winter: raise temp (pre-heat) so heater can ride peak with element off
-        sign  = +1 if season == "WINTER" else -1
-        verb  = "pre-heat" if season == "WINTER" else "pre-cool"
-        side  = "above"   if season == "WINTER" else "below"
+        # Cooling: drop temp before peak so AC rides peak with compressor off
+        # Heating: raise temp before peak so heater rides peak with element off
+        sign  = +1 if heating_dominant else -1
+        verb  = "pre-heat" if heating_dominant else "pre-cool"
+        side  = "above"   if heating_dominant else "below"
         if not batt_good:
             lever        = "both"
             grid_allowed = True
@@ -989,6 +1000,7 @@ def _run_cycle(config: dict) -> None:
         "solar_kw":    pwall["solar_kw"],
         "load_kw":     pwall.get("load_kw", 0),
         "grid_kw":     pwall.get("grid_kw", 0),
+        "zone_modes":  {z: nest_devs[z].get("hvac_mode", "") for z in nest_devs},
     })
 
     # ── Update learning day record ────────────────────────────────────────────
