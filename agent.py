@@ -111,14 +111,14 @@ def is_pre_peak(dt: datetime) -> bool:
     return 12 <= h < 14
 
 def is_top_off_window(dt: datetime) -> bool:
-    """True if dt is in the post-peak grid top-off window."""
+    """True if dt is in the post-peak grid top-off window.
+
+    9–11pm year-round, aligned with the 9pm day→night comfort drop
+    (76°F → 73°F) so grid assists during the heavy cooling stage.
+    """
     if dt.weekday() >= 5:
         return False
-    h = dt.hour
-    s = get_season(dt.month)
-    if s != "WINTER":
-        return 20 <= h < 22      # Summer: 8–10pm
-    return 21 <= h < 23          # Winter evening: 9–11pm
+    return 21 <= dt.hour < 23
     # Winter morning peak → no grid top-off (solar handles recharge)
 
 def is_nighttime(dt: datetime) -> bool:
@@ -339,12 +339,13 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
             for _ in ("family", "guest")
         )
 
-    decisions    = []
-    thermo_delta = 0       # °F above/below each zone's baseline
-    grid_allowed = False
-    lever        = "none"
-    margin_tier  = {"setback": 0, "label": "Ample", "color": "GREEN"}
-    poll_mins    = poll_interval_minutes(now)
+    decisions     = []
+    thermo_delta  = 0       # °F above/below each zone's baseline
+    grid_allowed  = False
+    lever         = "none"
+    target_reserve = BATTERY_FLOOR  # Powerwall reserve % to enforce this cycle
+    margin_tier   = {"setback": 0, "label": "Ample", "color": "GREEN"}
+    poll_mins     = poll_interval_minutes(now)
 
     hold_note = (
         f" | Hold: family={zone_baselines['family']}°F guest={zone_baselines['guest']}°F"
@@ -394,6 +395,7 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
         if not batt_good:
             lever        = "both"
             grid_allowed = True
+            target_reserve = target_pp
             pre_cool_deg = min(MAX_PRECOOL, 4 if solar_kw > 2 else 3)
             thermo_delta = -pre_cool_deg
             kwh_deficit  = (target_pp - battery_pct) / 100 * BATTERY_KWH
@@ -411,8 +413,9 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
         lever        = "none" if top_off_done else "grid"
         thermo_delta = 0
         if not top_off_done:
-            grid_allowed  = True
-            kwh_to_full   = max(0, (100 - battery_pct) / 100 * BATTERY_KWH)
+            grid_allowed   = True
+            target_reserve = 100
+            kwh_to_full    = max(0, (100 - battery_pct) / 100 * BATTERY_KWH)
             mins_to_full  = math.ceil(kwh_to_full / GRID_CHARGE_KW * 60)
             energy_rate   = 7.30 if season != "WINTER" else 7.38
             decisions.append(f"🔌 Daily top-off to 100% | {battery_pct:.0f}% now | {kwh_to_full:.1f}kWh | ~{mins_to_full}min | {energy_rate}¢/kWh")
@@ -452,6 +455,7 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
         if not batt_good and deficit > 0.3:
             lever = "grid"
             grid_allowed = True
+            target_reserve = target_pp
             decisions.append(f"⚡ Lever 1 (grid): Solar projects {solar_projected:.1f}kWh short by {deficit:.1f}kWh | {hrs_until_pk:.1f}h until peak")
         else:
             lever = "none"
@@ -469,9 +473,10 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
         ) * 0.25
         deficit = max(0, target_kwh - current_kwh - solar_proj)
         if not batt_good and deficit > 0.3:
-            lever        = "grid"
-            grid_allowed = True
-            mins_needed  = math.ceil(deficit / GRID_CHARGE_KW * 60)
+            lever          = "grid"
+            grid_allowed   = True
+            target_reserve = target_pp
+            mins_needed    = math.ceil(deficit / GRID_CHARGE_KW * 60)
             decisions.append(f"🔌 Lever 1 (grid): {battery_pct:.0f}% needs {deficit:.1f}kWh more for {target_pp}% target | {mins_needed}min grid{hold_note}")
         else:
             lever = "none"
@@ -495,6 +500,7 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
         "decisions":           decisions,
         "poll_interval_mins":  poll_mins,
         "target_pre_peak":     target_pp,
+        "target_reserve":      target_reserve,
         "base_target":         base_target,
         "hold_adj":            hold_adj,
         "season":              season,
@@ -551,8 +557,7 @@ def get_powerwall_state(tesla: TeslaFleet, config: dict) -> dict:
         return {}
 
 def set_powerwall_mode(tesla: TeslaFleet, config: dict, grid_allowed: bool,
-                       battery_pct: float, target_pp: int = 0,
-                       pre_peak: bool = False) -> None:
+                       battery_pct: float, target_reserve: int = BATTERY_FLOOR) -> None:
     """
     Set Powerwall operating mode + Lever 1 (grid charging).
 
@@ -561,11 +566,12 @@ def set_powerwall_mode(tesla: TeslaFleet, config: dict, grid_allowed: bool,
     "save battery for outages, use grid for daily load" — the opposite of what
     SRP optimization needs.
 
-    Lever 1 implementation: during pre-peak when battery is below target_pp,
-    raise backup_reserve_percent to target_pp. Powerwall treats that as a
-    must-hold reserve and pulls from grid+solar to reach it. Once peak begins,
-    reserve drops back to BATTERY_FLOOR so the battery can fully discharge
-    through the peak window.
+    Lever 1 implementation: when grid_allowed and battery is below target_reserve,
+    raise backup_reserve_percent to target_reserve. Powerwall treats that as a
+    must-hold reserve and pulls from grid+solar to reach it. Each decision branch
+    sets its own target_reserve (pre-peak/solar/off-peak deficit → target_pp,
+    top-off → 100, overnight assist → BATTERY_FLOOR so battery discharges first
+    and grid auto-takes over at the floor).
     """
     if tesla is None:
         log.warning("Tesla not authorized — skipping Powerwall mode set")
@@ -582,10 +588,10 @@ def set_powerwall_mode(tesla: TeslaFleet, config: dict, grid_allowed: bool,
             log.error("Powerwall site_id not found — cannot set mode")
             return
 
-        # Lever 1: force grid-charge to target_pp during pre-peak when needed
-        if pre_peak and grid_allowed and battery_pct < target_pp:
-            reserve = min(100, int(target_pp))
-            log.info(f"Lever 1 active: forcing grid-charge — reserve {reserve}% (battery at {battery_pct:.0f}%, target {target_pp}%)")
+        # Lever 1: force grid-charge to target_reserve when branch wants it
+        if grid_allowed and battery_pct < target_reserve:
+            reserve = min(100, int(target_reserve))
+            log.info(f"Lever 1 active: forcing grid-charge — reserve {reserve}% (battery at {battery_pct:.0f}%, target {target_reserve}%)")
         else:
             reserve = BATTERY_FLOOR
 
@@ -892,19 +898,25 @@ def update_daily_record(state: dict, pwall: dict, dt: datetime) -> dict:
     return state
 
 def maybe_commit_day(state: dict, history: list[dict], dt: datetime) -> tuple[dict, list[dict]]:
-    """At midnight, commit the completed day record to history."""
+    """Commit yesterday's day_record on the first cycle of any new calendar day.
+
+    Cadence-tolerant: works regardless of scheduler clock alignment, restart
+    timing, or missed midnight wake-ups. The scheduler runs at HH:20:42 and
+    HH:50:42, so the prior wall-clock window (`hour==0 and minute<20`) was
+    unreachable.
+    """
     last_commit = state.get("last_day_commit", "")
     today_str   = dt.strftime("%Y-%m-%d")
     prev_str    = (dt - timedelta(days=1)).strftime("%Y-%m-%d")
 
-    if last_commit != prev_str and dt.hour == 0 and dt.minute < 20:
+    if last_commit != today_str:
         dr = state.get("day_record", {})
         if dr.get("net_kwh_depleted") is not None:
             dr["date"] = prev_str
             history.append(dr)
             save_history(history)
             log.info(f"Day record committed: {prev_str} | {dr}")
-        state["last_day_commit"] = prev_str
+        state["last_day_commit"] = today_str
         state["day_record"]      = {"day_high_f": 0}  # reset for new day
 
     return state, history
@@ -1021,8 +1033,7 @@ def _run_cycle(config: dict) -> None:
         tesla, config,
         grid_allowed=decision["grid_allowed"],
         battery_pct=pwall["battery_pct"],
-        target_pp=decision["target_pre_peak"],
-        pre_peak=decision.get("is_pre_peak", False),
+        target_reserve=decision["target_reserve"],
     )
 
     # ── Act: push thermostat commands ─────────────────────────────────────────
