@@ -452,7 +452,11 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
         target_kwh = target_pp / 100 * BATTERY_KWH
         current_kwh = battery_pct / 100 * BATTERY_KWH
         deficit = max(0, target_kwh - current_kwh - solar_projected)
-        if not batt_good and deficit > 0.3:
+        # Solar primary, grid only if projections fall meaningfully short.
+        # 1.5 kWh ≈ 11% of battery — prevents trigger-happy grid pulls on
+        # normal morning ramp-up. Pre-peak window (12–2pm) backstops if
+        # solar genuinely fails. Drop back to 0.3 to revert.
+        if not batt_good and deficit > 1.5:
             lever = "grid"
             grid_allowed = True
             target_reserve = target_pp
