@@ -565,17 +565,21 @@ def set_powerwall_mode(tesla: TeslaFleet, config: dict, grid_allowed: bool,
     """
     Set Powerwall operating mode + Lever 1 (grid charging).
 
-    Operating mode is ALWAYS self_consumption — the only mode where the battery
-    actually discharges to cover home load. Tesla's "backup" mode means
-    "save battery for outages, use grid for daily load" — the opposite of what
-    SRP optimization needs.
+    Operating mode flips between two states:
+      - autonomous (Time-Based Control) during active grid-charge windows.
+        Self-Powered throttles grid import to ~1.7 kW; autonomous lets the
+        Powerwall pull at full ~5 kW so reserve raises actually fill the battery.
+      - self_consumption otherwise — the only mode where the battery actually
+        discharges to cover home load. Tesla's "backup" mode preserves battery
+        for outages (opposite of what SRP optimization needs).
+
+    Active grid-charge = Lever 1 firing AND target_reserve above BATTERY_FLOOR.
+    Pre-peak / top-off / solar deficit / off-peak deficit branches qualify;
+    overnight assist (target_reserve = floor) does not.
 
     Lever 1 implementation: when grid_allowed and battery is below target_reserve,
     raise backup_reserve_percent to target_reserve. Powerwall treats that as a
-    must-hold reserve and pulls from grid+solar to reach it. Each decision branch
-    sets its own target_reserve (pre-peak/solar/off-peak deficit → target_pp,
-    top-off → 100, overnight assist → BATTERY_FLOOR so battery discharges first
-    and grid auto-takes over at the floor).
+    must-hold reserve and pulls from grid+solar to reach it.
     """
     if tesla is None:
         log.warning("Tesla not authorized — skipping Powerwall mode set")
@@ -593,7 +597,8 @@ def set_powerwall_mode(tesla: TeslaFleet, config: dict, grid_allowed: bool,
             return
 
         # Lever 1: force grid-charge to target_reserve when branch wants it
-        if grid_allowed and battery_pct < target_reserve:
+        actively_charging = grid_allowed and battery_pct < target_reserve and target_reserve > BATTERY_FLOOR
+        if actively_charging:
             reserve = min(100, int(target_reserve))
             log.info(f"Lever 1 active: forcing grid-charge — reserve {reserve}% (battery at {battery_pct:.0f}%, target {target_reserve}%)")
         else:
@@ -603,11 +608,13 @@ def set_powerwall_mode(tesla: TeslaFleet, config: dict, grid_allowed: bool,
                   path_vars={"site_id": site_id},
                   backup_reserve_percent=reserve)
 
+        # autonomous unlocks ~5 kW grid charging; self_consumption throttles to ~1.7 kW
+        op_mode = "autonomous" if actively_charging else "self_consumption"
         tesla.api("BATTERY_OPERATION_MODE",
                   path_vars={"site_id": site_id},
-                  default_real_mode="self_consumption")
+                  default_real_mode=op_mode)
 
-        log.info(f"Powerwall mode → self_consumption | reserve {reserve}% | grid_allowed={grid_allowed}")
+        log.info(f"Powerwall mode → {op_mode} | reserve {reserve}% | grid_allowed={grid_allowed}")
     except Exception as e:
         log.error(f"Powerwall set mode error: {e}")
 
