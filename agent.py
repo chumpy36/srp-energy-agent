@@ -465,6 +465,18 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
             lever = "none"
             decisions.append(f"☀️  Solar {solar_kw:.1f}kW | {battery_pct:.0f}% → {target_pp}% | {'on track' if not batt_good else 'battery ready'}{hold_note}")
 
+    # ── POST-PEAK COAST (summer 8–9pm gap before top-off) ────────────────────
+    # Summer peak ends 8pm, top-off starts 9pm. Without this branch the
+    # OFF-PEAK DEFAULT would see battery low (just rode out peak) and force
+    # Lever 1 grid-charge to target_pp — pulling 5 kW an hour before top-off
+    # would have done it cleanly. Coast in self_consumption with reserve at
+    # BATTERY_FLOOR and let top-off handle the refill.
+    elif season in ("SUMMER", "SUMMER_PEAK") and now.hour == 20:
+        thermo_delta = 0
+        lever = "none"
+        grid_allowed = False
+        decisions.append(f"😌 Post-peak coast | battery {battery_pct:.0f}% | top-off in <1h{hold_note}")
+
     # ── OFF-PEAK DEFAULT ──────────────────────────────────────────────────────
     else:
         thermo_delta = 0
