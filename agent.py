@@ -21,7 +21,7 @@ import logging
 import math
 import os
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -90,9 +90,50 @@ def get_season(month: int) -> str:
     if month in (5, 6, 9, 10):   return "SUMMER"
     return "WINTER"
 
+def _nth_weekday_of_month(year: int, month: int, weekday: int, n: int) -> date:
+    """Return the date of the nth occurrence of `weekday` (0=Mon..6=Sun) in (year, month)."""
+    first = date(year, month, 1)
+    offset = (weekday - first.weekday()) % 7
+    return first + timedelta(days=offset + 7 * (n - 1))
+
+def _last_weekday_of_month(year: int, month: int, weekday: int) -> date:
+    """Return the date of the last occurrence of `weekday` (0=Mon..6=Sun) in (year, month)."""
+    if month == 12:
+        next_first = date(year + 1, 1, 1)
+    else:
+        next_first = date(year, month + 1, 1)
+    last_day = next_first - timedelta(days=1)
+    offset = (last_day.weekday() - weekday) % 7
+    return last_day - timedelta(days=offset)
+
+def is_srp_holiday(dt: datetime) -> bool:
+    """True if dt falls on an SRP-observed holiday.
+
+    SRP treats six federal holidays as off-peak days — peak rates do not
+    apply at all. Per Steve 2026-05-11: grid is usable any time on these days.
+
+    Fixed dates: New Year's, Independence Day, Christmas.
+    Floating: Memorial Day (last Mon May), Labor Day (1st Mon Sep),
+    Thanksgiving (4th Thu Nov).
+    """
+    y, m, d = dt.year, dt.month, dt.day
+    if (m, d) in {(1, 1), (7, 4), (12, 25)}:
+        return True
+    if m == 5 and dt.date() == _last_weekday_of_month(y, 5, 0):
+        return True
+    if m == 9 and dt.date() == _nth_weekday_of_month(y, 9, 0, 1):
+        return True
+    if m == 11 and dt.date() == _nth_weekday_of_month(y, 11, 3, 4):
+        return True
+    return False
+
+def is_weekend_or_holiday(dt: datetime) -> bool:
+    """Saturday, Sunday, or SRP holiday — days when no peak applies."""
+    return dt.weekday() >= 5 or is_srp_holiday(dt)
+
 def is_peak(dt: datetime) -> bool:
-    """True if dt falls in an SRP on-peak window (weekdays only)."""
-    if dt.weekday() >= 5:        # Saturday=5, Sunday=6
+    """True if dt falls in an SRP on-peak window (weekdays only, non-holiday)."""
+    if is_weekend_or_holiday(dt):
         return False
     h = dt.hour
     s = get_season(dt.month)
@@ -102,7 +143,7 @@ def is_peak(dt: datetime) -> bool:
 
 def is_pre_peak(dt: datetime) -> bool:
     """True if dt is in the 2-hour preparation window before a peak."""
-    if dt.weekday() >= 5 or is_peak(dt):
+    if is_weekend_or_holiday(dt) or is_peak(dt):
         return False
     h = dt.hour
     s = get_season(dt.month)
@@ -113,13 +154,16 @@ def is_pre_peak(dt: datetime) -> bool:
 def is_top_off_window(dt: datetime) -> bool:
     """True if dt is in the post-peak grid top-off window.
 
-    9–11pm year-round, aligned with the 9pm day→night comfort drop
-    (76°F → 73°F) so grid assists during the heavy cooling stage.
+    9–11pm every night (weekday + weekend + holiday) — aligned with the 9pm
+    day→night comfort drop (76°F → 73°F) so grid assists during the heavy
+    cooling stage.
     """
-    if dt.weekday() >= 5:
-        return False
     return 21 <= dt.hour < 23
-    # Winter morning peak → no grid top-off (solar handles recharge)
+
+def is_weekend_afternoon_window(dt: datetime) -> bool:
+    """4–6pm on weekends and SRP holidays — eligible TBC charge window
+    when day high has already exceeded 100°F."""
+    return is_weekend_or_holiday(dt) and 16 <= dt.hour < 18
 
 def is_nighttime(dt: datetime) -> bool:
     return dt.hour >= 21 or dt.hour < 5
@@ -282,14 +326,15 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
       poll_interval_mins   — int
       target_pre_peak      — int (%)
     """
-    now         = datetime.now(TZ)
-    season      = get_season(now.month)
-    sub_phase   = get_peak_sub_phase(now)
-    peak        = is_peak(now)
-    pre_peak    = is_pre_peak(now)
-    top_off_win = is_top_off_window(now)
-    night       = is_nighttime(now)
-    hour_frac   = now.hour + now.minute / 60
+    now            = datetime.now(TZ)
+    season         = get_season(now.month)
+    sub_phase      = get_peak_sub_phase(now)
+    peak           = is_peak(now)
+    pre_peak       = is_pre_peak(now)
+    top_off_win    = is_top_off_window(now)
+    night          = is_nighttime(now)
+    weekend_pm_win = is_weekend_afternoon_window(now)
+    hour_frac      = now.hour + now.minute / 60
 
     battery_pct  = state["battery_pct"]
     outside_f    = state["outside_temp_f"]
@@ -343,7 +388,7 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
     thermo_delta  = 0       # °F above/below each zone's baseline
     grid_allowed  = False
     lever         = "none"
-    target_reserve = BATTERY_FLOOR  # Powerwall reserve % to enforce this cycle
+    powerwall_mode = "self_consumption"  # Tesla Time-Based Control ("autonomous") only during pre-peak + top-off charge windows
     margin_tier   = {"setback": 0, "label": "Ample", "color": "GREEN"}
     poll_mins     = poll_interval_minutes(now)
 
@@ -395,11 +440,11 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
         if not batt_good:
             lever        = "both"
             grid_allowed = True
-            target_reserve = target_pp
+            powerwall_mode = "autonomous"
             pre_cool_deg = min(MAX_PRECOOL, 4 if solar_kw > 2 else 3)
             thermo_delta = -pre_cool_deg
             kwh_deficit  = (target_pp - battery_pct) / 100 * BATTERY_KWH
-            decisions.append(f"🔋 Lever 1 (grid): Charging to {target_pp}% | {battery_pct:.0f}% now | {kwh_deficit:.1f}kWh needed{hold_note}")
+            decisions.append(f"🔋 Lever 1 (TBC): Charging toward {target_pp}% | {battery_pct:.0f}% now | {kwh_deficit:.1f}kWh needed{hold_note}")
             decisions.append(f"🌡️  Lever 2 (pre-cool): family {zone_baselines['family']+thermo_delta}°F, guest {zone_baselines['guest']+thermo_delta}°F ({pre_cool_deg}°F below baseline)")
         else:
             lever        = "temp"
@@ -414,11 +459,11 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
         thermo_delta = 0
         if not top_off_done:
             grid_allowed   = True
-            target_reserve = 100
+            powerwall_mode = "autonomous"
             kwh_to_full    = max(0, (100 - battery_pct) / 100 * BATTERY_KWH)
             mins_to_full  = math.ceil(kwh_to_full / GRID_CHARGE_KW * 60)
             energy_rate   = 7.30 if season != "WINTER" else 7.38
-            decisions.append(f"🔌 Daily top-off to 100% | {battery_pct:.0f}% now | {kwh_to_full:.1f}kWh | ~{mins_to_full}min | {energy_rate}¢/kWh")
+            decisions.append(f"🔌 Daily top-off (TBC) | {battery_pct:.0f}% now | {kwh_to_full:.1f}kWh | ~{mins_to_full}min | {energy_rate}¢/kWh")
         else:
             og = assess_overnight(battery_pct, season)
             grid_allowed = not og["can_go_off_grid"]
@@ -440,30 +485,33 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
             grid_allowed = True
             decisions.append(f"🔌 Lever 1 (grid): Overnight assist | margin {og['margin']}kWh insufficient")
 
-    # ── SOLAR WINDOW ─────────────────────────────────────────────────────────
-    elif solar_kw > 0:
+    # ── WEEKEND/HOLIDAY AFTERNOON TBC WINDOW (4–6pm, hot days only) ──────────
+    # Steve 2026-05-09: weekends and SRP holidays are non-peak, but the
+    # battery still wants an afternoon boost on hot days after solar tapers
+    # and before the night cooling load hits. Gate on measured day_high — by
+    # 4pm in Mesa summer the high is essentially locked in.
+    elif weekend_pm_win:
         thermo_delta = 0
-        hrs_until_pk = hours_until_next_peak(now)
-        # Simple solar forecast: sum remaining solar before peak
-        solar_projected = sum(
-            calc_solar_kw(hour_frac + i * 0.25, outside_f)
-            for i in range(int(hrs_until_pk * 4))
-        ) * 0.25  # kWh
-        target_kwh = target_pp / 100 * BATTERY_KWH
-        current_kwh = battery_pct / 100 * BATTERY_KWH
-        deficit = max(0, target_kwh - current_kwh - solar_projected)
-        # Solar primary, grid only if projections fall meaningfully short.
-        # 1.5 kWh ≈ 11% of battery — prevents trigger-happy grid pulls on
-        # normal morning ramp-up. Pre-peak window (12–2pm) backstops if
-        # solar genuinely fails. Drop back to 0.3 to revert.
-        if not batt_good and deficit > 1.5:
-            lever = "grid"
-            grid_allowed = True
-            target_reserve = target_pp
-            decisions.append(f"⚡ Lever 1 (grid): Solar projects {solar_projected:.1f}kWh short by {deficit:.1f}kWh | {hrs_until_pk:.1f}h until peak")
+        day_high_f = state.get("day_record", {}).get("day_high_f", 0)
+        if day_high_f >= 100:
+            lever          = "grid"
+            grid_allowed   = True
+            powerwall_mode = "autonomous"
+            decisions.append(f"🔌 Weekend/holiday afternoon TBC | day high {day_high_f:.0f}°F ≥ 100 | {battery_pct:.0f}% now")
         else:
             lever = "none"
-            decisions.append(f"☀️  Solar {solar_kw:.1f}kW | {battery_pct:.0f}% → {target_pp}% | {'on track' if not batt_good else 'battery ready'}{hold_note}")
+            grid_allowed = False
+            decisions.append(f"😌 Weekend/holiday afternoon | day high {day_high_f:.0f}°F < 100 | levers idle")
+
+    # ── SOLAR WINDOW ─────────────────────────────────────────────────────────
+    # Solar-only — no grid trigger here. Pre-peak (12–2pm) backstops if solar
+    # falls short. Steve approved removing this branch's grid-charge arm 2026-05-09:
+    # the Self-Powered → autonomous mode flip would cap import at ~1.7 kW anyway,
+    # and pre-peak has the time and headroom to refill at full TBC rate.
+    elif solar_kw > 0:
+        thermo_delta = 0
+        lever = "none"
+        decisions.append(f"☀️  Solar {solar_kw:.1f}kW | {battery_pct:.0f}% → {target_pp}% | {'on track' if not batt_good else 'battery ready'}{hold_note}")
 
     # ── POST-PEAK COAST (summer 8–9pm gap before top-off) ────────────────────
     # Summer peak ends 8pm, top-off starts 9pm. Without this branch the
@@ -478,26 +526,13 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
         decisions.append(f"😌 Post-peak coast | battery {battery_pct:.0f}% | top-off in <1h{hold_note}")
 
     # ── OFF-PEAK DEFAULT ──────────────────────────────────────────────────────
+    # Idle only — active grid-charge arm removed 2026-05-09 (Steve approved).
+    # Pre-peak (12–2pm) and top-off (9–11pm) handle all forced charging via TBC.
     else:
         thermo_delta = 0
-        hrs_until_pk = hours_until_next_peak(now)
-        target_kwh   = target_pp / 100 * BATTERY_KWH
-        current_kwh  = battery_pct / 100 * BATTERY_KWH
-        solar_proj   = sum(
-            calc_solar_kw(hour_frac + i * 0.25, outside_f)
-            for i in range(int(hrs_until_pk * 4))
-        ) * 0.25
-        deficit = max(0, target_kwh - current_kwh - solar_proj)
-        if not batt_good and deficit > 0.3:
-            lever          = "grid"
-            grid_allowed   = True
-            target_reserve = target_pp
-            mins_needed    = math.ceil(deficit / GRID_CHARGE_KW * 60)
-            decisions.append(f"🔌 Lever 1 (grid): {battery_pct:.0f}% needs {deficit:.1f}kWh more for {target_pp}% target | {mins_needed}min grid{hold_note}")
-        else:
-            lever = "none"
-            grid_allowed = False
-            decisions.append(f"😌 Off-peak | battery {battery_pct:.0f}% | {'on track' if not batt_good else 'ready'} | levers idle{hold_note}")
+        lever = "none"
+        grid_allowed = False
+        decisions.append(f"😌 Off-peak | battery {battery_pct:.0f}% | {'on track' if not batt_good else 'ready'} | levers idle{hold_note}")
 
     # ── Build per-zone thermostat targets ─────────────────────────────────────
     thermostat_targets = {}
@@ -516,7 +551,7 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
         "decisions":           decisions,
         "poll_interval_mins":  poll_mins,
         "target_pre_peak":     target_pp,
-        "target_reserve":      target_reserve,
+        "powerwall_mode":      powerwall_mode,
         "base_target":         base_target,
         "hold_adj":            hold_adj,
         "season":              season,
@@ -572,26 +607,19 @@ def get_powerwall_state(tesla: TeslaFleet, config: dict) -> dict:
         log.error(f"Powerwall API error: {e}")
         return {}
 
-def set_powerwall_mode(tesla: TeslaFleet, config: dict, grid_allowed: bool,
-                       battery_pct: float, target_reserve: int = BATTERY_FLOOR) -> None:
+def set_powerwall_mode(tesla: TeslaFleet, config: dict, powerwall_mode: str) -> None:
     """
-    Set Powerwall operating mode + Lever 1 (grid charging).
+    Set Powerwall operating mode (Lever 1).
 
-    Operating mode flips between two states:
-      - autonomous (Time-Based Control) during active grid-charge windows.
-        Self-Powered throttles grid import to ~1.7 kW; autonomous lets the
-        Powerwall pull at full ~5 kW so reserve raises actually fill the battery.
-      - self_consumption otherwise — the only mode where the battery actually
-        discharges to cover home load. Tesla's "backup" mode preserves battery
-        for outages (opposite of what SRP optimization needs).
+    Two states only:
+      - autonomous (Time-Based Control) during pre-peak (12–2pm) and top-off
+        (9–11pm) charge windows. Pulls from grid at full ~5 kW.
+      - self_consumption everywhere else — battery discharges to cover load.
 
-    Active grid-charge = Lever 1 firing AND target_reserve above BATTERY_FLOOR.
-    Pre-peak / top-off / solar deficit / off-peak deficit branches qualify;
-    overnight assist (target_reserve = floor) does not.
-
-    Lever 1 implementation: when grid_allowed and battery is below target_reserve,
-    raise backup_reserve_percent to target_reserve. Powerwall treats that as a
-    must-hold reserve and pulls from grid+solar to reach it.
+    Reserve floor (BATTERY_FLOOR, 15%) is set manually once in the Tesla app
+    by the homeowner. Agent never writes backup_reserve_percent; setting reserve
+    and autonomous mode simultaneously made Tesla revert to Self-Powered behavior
+    and throttle grid import to ~1.7 kW (verified 2026-05-09).
     """
     if tesla is None:
         log.warning("Tesla not authorized — skipping Powerwall mode set")
@@ -608,25 +636,11 @@ def set_powerwall_mode(tesla: TeslaFleet, config: dict, grid_allowed: bool,
             log.error("Powerwall site_id not found — cannot set mode")
             return
 
-        # Lever 1: force grid-charge to target_reserve when branch wants it
-        actively_charging = grid_allowed and battery_pct < target_reserve and target_reserve > BATTERY_FLOOR
-        if actively_charging:
-            reserve = min(100, int(target_reserve))
-            log.info(f"Lever 1 active: forcing grid-charge — reserve {reserve}% (battery at {battery_pct:.0f}%, target {target_reserve}%)")
-        else:
-            reserve = BATTERY_FLOOR
-
-        tesla.api("BATTERY_BACKUP_RESERVE",
-                  path_vars={"site_id": site_id},
-                  backup_reserve_percent=reserve)
-
-        # autonomous unlocks ~5 kW grid charging; self_consumption throttles to ~1.7 kW
-        op_mode = "autonomous" if actively_charging else "self_consumption"
         tesla.api("BATTERY_OPERATION_MODE",
                   path_vars={"site_id": site_id},
-                  default_real_mode=op_mode)
+                  default_real_mode=powerwall_mode)
 
-        log.info(f"Powerwall mode → {op_mode} | reserve {reserve}% | grid_allowed={grid_allowed}")
+        log.info(f"Powerwall mode → {powerwall_mode}")
     except Exception as e:
         log.error(f"Powerwall set mode error: {e}")
 
@@ -1054,9 +1068,7 @@ def _run_cycle(config: dict) -> None:
     # ── Act: set Powerwall mode ───────────────────────────────────────────────
     set_powerwall_mode(
         tesla, config,
-        grid_allowed=decision["grid_allowed"],
-        battery_pct=pwall["battery_pct"],
-        target_reserve=decision["target_reserve"],
+        powerwall_mode=decision["powerwall_mode"],
     )
 
     # ── Act: push thermostat commands ─────────────────────────────────────────
