@@ -290,6 +290,16 @@ def calc_margin_tier(kwh_margin: float, battery_pct: float) -> dict:
         return {"setback": 1,             "label": "Comfortable", "color": "YELLOW"}
     return          {"setback": 0,        "label": "Ample",       "color": "GREEN"}
 
+# Steve 2026-05-12: comfort-first canon. Tier table alone fires "Tight" at
+# t=0 on hot days even when solar is still carrying the load. Ceiling rises
+# +1°F per elapsed peak hour and clamps the tier's setback. Summer peak only;
+# winter peak left unconstrained for now.
+def peak_setback_ceiling(dt: datetime) -> int:
+    if not is_peak(dt) or get_season(dt.month) == "WINTER":
+        return CRIT_SETBACK
+    hours_elapsed = dt.hour - 14   # summer peak starts at 14:00
+    return min(MAX_SETBACK, max(0, hours_elapsed))
+
 # ═══════════════════════════════════════════════════════════════════════════
 # OVERNIGHT VIABILITY
 # ═══════════════════════════════════════════════════════════════════════════
@@ -364,12 +374,14 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
         for z in ("family", "guest")
     )
 
-    # Learning model → target pre-peak
-    regressions   = build_regressions(history, season)
-    static_target = {"SUMMER_PEAK": 92, "SUMMER": 85, "WINTER": 78}[season]
-    base_target   = predict_target(regressions, forecast_f, season)
-    hold_adj      = round(min(10, hold_load_extra * 5))
-    target_pp     = min(97, base_target + hold_adj)
+    # Steve 2026-05-12: regression scrapped. TBC noon-to-midnight charges to
+    # 100% via TOU schedule naturally; agent's job is just to flip the mode
+    # and pre-cool. target_pp = 100 keeps the batt_good gate honest so the
+    # pre-peak Lever 1 log line stays accurate until the battery is full.
+    regressions = build_regressions(history, season)  # kept for dashboard history
+    base_target = predict_target(regressions, forecast_f, season)  # informational only
+    hold_adj    = round(min(10, hold_load_extra * 5))
+    target_pp   = 100
 
     # Battery math
     batt_floor  = BATTERY_FLOOR
@@ -388,7 +400,12 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
     thermo_delta  = 0       # °F above/below each zone's baseline
     grid_allowed  = False
     lever         = "none"
-    powerwall_mode = "self_consumption"  # Tesla Time-Based Control ("autonomous") only during pre-peak + top-off charge windows
+    # Steve 2026-05-12: Powerwall sits in TBC (autonomous) from noon through
+    # midnight — covers pre-peak charge, peak hold, post-peak coast, top-off,
+    # and late evening as one continuous TOU-driven block. Self-consumption
+    # midnight→noon lets the battery coast overnight and recharge from solar
+    # in the morning.
+    powerwall_mode = "autonomous" if 12 <= now.hour < 24 else "self_consumption"
     margin_tier   = {"setback": 0, "label": "Ample", "color": "GREEN"}
     poll_mins     = poll_interval_minutes(now)
 
@@ -411,22 +428,28 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
             kwh_from_batt    = max(0, net_draw * solar_assist_hrs) + total_load(0) * solar_gone_hrs
             kwh_margin       = batt_usable - kwh_from_batt
             margin_tier      = calc_margin_tier(kwh_margin, battery_pct)
-            thermo_delta     = margin_tier["setback"]
+            raw_setback      = margin_tier["setback"]
+            ceiling          = peak_setback_ceiling(now)
+            thermo_delta     = min(raw_setback, ceiling)
+            ceil_note        = f" | comfort ceiling +{ceiling}°F (raw {raw_setback}°F)" if raw_setback > ceiling else ""
             net_lbl = f"net-charging +{abs(net_draw):.1f}kW" if net_draw <= 0 else f"net draw {net_draw:.1f}kW"
-            decisions.append(f"☀️  Solar-assisted peak | {solar_kw:.1f}kW solar, {net_lbl} | Margin {kwh_margin:.1f}kWh → {margin_tier['label']}{hold_note}")
-            if margin_tier["setback"] > 0:
-                decisions.append(f"🌡️  +{margin_tier['setback']}°F from baseline → family {zone_baselines['family']+thermo_delta}°F, guest {zone_baselines['guest']+thermo_delta}°F")
+            decisions.append(f"☀️  Solar-assisted peak | {solar_kw:.1f}kW solar, {net_lbl} | Margin {kwh_margin:.1f}kWh → {margin_tier['label']}{ceil_note}{hold_note}")
+            if thermo_delta > 0:
+                decisions.append(f"🌡️  +{thermo_delta}°F from baseline → family {zone_baselines['family']+thermo_delta}°F, guest {zone_baselines['guest']+thermo_delta}°F")
 
         elif sub_phase == "solar_gone_peak":
             hrs_left    = 20 - now.hour
             kwh_needed  = total_load(0) * hrs_left
             kwh_margin  = batt_usable - kwh_needed
             margin_tier = calc_margin_tier(kwh_margin, battery_pct)
-            thermo_delta = margin_tier["setback"]
-            decisions.append(f"🔋 Solar-gone peak | {hrs_left:.1f}h remain | {batt_usable:.1f}kWh avail vs {kwh_needed:.1f}kWh needed | {margin_tier['label']}{hold_note}")
-            decisions.append(f"🌡️  +{margin_tier['setback']}°F → family {zone_baselines['family']+thermo_delta}°F, guest {zone_baselines['guest']+thermo_delta}°F | Every {poll_mins}min")
+            raw_setback  = margin_tier["setback"]
+            ceiling      = peak_setback_ceiling(now)
+            thermo_delta = min(raw_setback, ceiling)
+            ceil_note    = f" | comfort ceiling +{ceiling}°F (raw {raw_setback}°F)" if raw_setback > ceiling else ""
+            decisions.append(f"🔋 Solar-gone peak | {hrs_left:.1f}h remain | {batt_usable:.1f}kWh avail vs {kwh_needed:.1f}kWh needed | {margin_tier['label']}{ceil_note}{hold_note}")
+            decisions.append(f"🌡️  +{thermo_delta}°F → family {zone_baselines['family']+thermo_delta}°F, guest {zone_baselines['guest']+thermo_delta}°F | Every {poll_mins}min")
 
-        else:  # Winter morning or evening peak
+        else:  # Winter morning or evening peak (no comfort ceiling — left as-is)
             hrs_left    = (9 if sub_phase == "morning_peak" else 21) - now.hour
             kwh_needed  = total_load(0) * hrs_left
             kwh_margin  = batt_usable - kwh_needed
@@ -440,7 +463,6 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
         if not batt_good:
             lever        = "both"
             grid_allowed = True
-            powerwall_mode = "autonomous"
             pre_cool_deg = min(MAX_PRECOOL, 4 if solar_kw > 2 else 3)
             thermo_delta = -pre_cool_deg
             kwh_deficit  = (target_pp - battery_pct) / 100 * BATTERY_KWH
@@ -459,7 +481,6 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
         thermo_delta = 0
         if not top_off_done:
             grid_allowed   = True
-            powerwall_mode = "autonomous"
             kwh_to_full    = max(0, (100 - battery_pct) / 100 * BATTERY_KWH)
             mins_to_full  = math.ceil(kwh_to_full / GRID_CHARGE_KW * 60)
             energy_rate   = 7.30 if season != "WINTER" else 7.38
@@ -473,17 +494,16 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
                 decisions.append(f"🔌 Top-off complete | Grid overnight (margin only {og['margin']}kWh)")
 
     # ── NIGHTTIME ────────────────────────────────────────────────────────────
+    # Steve 2026-05-12: overnight assist scrapped. Battery coasts from midnight
+    # to ~5am in self_consumption mode (set by the noon→midnight default rule);
+    # solar recharges in the morning. Tesla still pulls grid as needed when the
+    # battery hits the reserve floor, but the agent never forces it.
     elif night:
-        thermo_delta = 0    # night comfort is the baseline
-        og = assess_overnight(battery_pct, season)
-        if og["can_go_off_grid"]:
-            lever = "none"
-            grid_allowed = False
-            decisions.append(f"🌙 Off-grid overnight | {og['kwh_avail']}kWh avail vs {og['kwh_needed']}kWh needed | {og['margin']}kWh margin")
-        else:
-            lever = "grid"
-            grid_allowed = True
-            decisions.append(f"🔌 Lever 1 (grid): Overnight assist | margin {og['margin']}kWh insufficient")
+        thermo_delta = 0
+        lever        = "none"
+        grid_allowed = False
+        og = assess_overnight(battery_pct, season)  # informational only
+        decisions.append(f"🌙 Overnight idle | battery {battery_pct:.0f}% | margin {og['margin']}kWh | levers idle{hold_note}")
 
     # ── WEEKEND/HOLIDAY AFTERNOON TBC WINDOW (4–6pm, hot days only) ──────────
     # Steve 2026-05-09: weekends and SRP holidays are non-peak, but the
@@ -496,7 +516,6 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
         if day_high_f >= 100:
             lever          = "grid"
             grid_allowed   = True
-            powerwall_mode = "autonomous"
             decisions.append(f"🔌 Weekend/holiday afternoon TBC | day high {day_high_f:.0f}°F ≥ 100 | {battery_pct:.0f}% now")
         else:
             lever = "none"
@@ -513,19 +532,8 @@ def run_agent(state: dict, config: dict, history: list[dict]) -> dict:
         lever = "none"
         decisions.append(f"☀️  Solar {solar_kw:.1f}kW | {battery_pct:.0f}% → {target_pp}% | {'on track' if not batt_good else 'battery ready'}{hold_note}")
 
-    # ── POST-PEAK COAST (summer 8–9pm gap before top-off) ────────────────────
-    # Summer peak ends 8pm, top-off starts 9pm. Without this branch the
-    # OFF-PEAK DEFAULT would see battery low (just rode out peak) and force
-    # Lever 1 grid-charge to target_pp — pulling 5 kW an hour before top-off
-    # would have done it cleanly. Coast in self_consumption with reserve at
-    # BATTERY_FLOOR and let top-off handle the refill.
-    elif season in ("SUMMER", "SUMMER_PEAK") and now.hour == 20:
-        thermo_delta = 0
-        lever = "none"
-        grid_allowed = False
-        decisions.append(f"😌 Post-peak coast | battery {battery_pct:.0f}% | top-off in <1h{hold_note}")
-
     # ── OFF-PEAK DEFAULT ──────────────────────────────────────────────────────
+    # Steve 2026-05-12: post-peak 8pm gap covered by TBC default — falls through here.
     # Idle only — active grid-charge arm removed 2026-05-09 (Steve approved).
     # Pre-peak (12–2pm) and top-off (9–11pm) handle all forced charging via TBC.
     else:
@@ -609,12 +617,16 @@ def get_powerwall_state(tesla: TeslaFleet, config: dict) -> dict:
 
 def set_powerwall_mode(tesla: TeslaFleet, config: dict, powerwall_mode: str) -> None:
     """
-    Set Powerwall operating mode (Lever 1).
+    Set Powerwall operating mode.
 
-    Two states only:
-      - autonomous (Time-Based Control) during pre-peak (12–2pm) and top-off
-        (9–11pm) charge windows. Pulls from grid at full ~5 kW.
-      - self_consumption everywhere else — battery discharges to cover load.
+    Steve 2026-05-12 redesign — two states, time-based:
+      - autonomous (Time-Based Control), noon to midnight. Tesla follows the
+        homeowner's TOU schedule end-to-end: grid-charges pre-peak to 100%,
+        discharges through peak (refuses grid import per TOU), tops off at 9–11pm,
+        idles late evening. Agent's only peak-window job is thermostat (Lever 2).
+      - self_consumption, midnight to noon. Battery coasts overnight; solar
+        recharges through the morning. Tesla still pulls grid when the battery
+        hits the reserve floor, but the agent doesn't force overnight charging.
 
     Reserve floor (BATTERY_FLOOR, 15%) is set manually once in the Tesla app
     by the homeowner. Agent never writes backup_reserve_percent; setting reserve
